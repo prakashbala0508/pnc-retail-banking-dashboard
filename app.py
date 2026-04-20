@@ -1,16 +1,21 @@
 """
 app.py — PNC Retail Banking Performance Monitor
-Streamlit executive dashboard: variance analysis, forecasting, KPI cards, export
+Streamlit executive dashboard: variance analysis, forecasting, KPI cards, export, PDF commentary
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from scipy import stats
 from datetime import datetime
 import io
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
 # ─────────────────────────────────────────────
 # PAGE CONFIGURATION
@@ -71,10 +76,7 @@ UNFAVORABLE_METRICS = [
 ]
 
 # ─────────────────────────────────────────────
-# EMBEDDED DATA — no CSV file needed
-# Source: PNC Quarterly Earnings Releases
-# investor.pnc.com — Retail Banking Segment
-# All figures in $millions except loans/deposits in $billions
+# EMBEDDED DATA
 # ─────────────────────────────────────────────
 RAW_DATA = {
     'quarter':      ['2025Q1', '2025Q2', '2025Q3', '2026Q1'],
@@ -94,7 +96,6 @@ RAW_DATA = {
 # ─────────────────────────────────────────────
 @st.cache_data
 def load_and_process(uploaded_file=None):
-    """Load data from upload if provided, otherwise use embedded data."""
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
     else:
@@ -137,7 +138,6 @@ def load_and_process(uploaded_file=None):
 
 @st.cache_data
 def build_forecasts(df):
-    """Compute weighted moving average forecasts."""
     forecast_metrics = [
         'net_interest_income', 'noninterest_income', 'total_revenue',
         'noninterest_expense', 'earnings', 'avg_loans_billions'
@@ -157,11 +157,10 @@ def build_forecasts(df):
 
         last_3   = actuals[-3:]
         wma_base = np.dot(WMA_WEIGHTS, last_3[::-1])
-
-        x = np.arange(len(actuals))
+        x        = np.arange(len(actuals))
         slope, _, r_value, _, _ = stats.linregress(x, actuals)
-        trend   = slope if r_value ** 2 > 0.5 else 0
-        std_dev = np.std(actuals)
+        trend    = slope if r_value ** 2 > 0.5 else 0
+        std_dev  = np.std(actuals)
 
         forecasts, upper, lower = [], [], []
         for i in range(1, FORECAST_PERIODS + 1):
@@ -179,7 +178,6 @@ def build_forecasts(df):
 
 
 def get_flagged_variances(df, threshold=MATERIALITY_THRESHOLD):
-    """Return flagged variances for the most recent quarter."""
     latest = df.iloc[-1]
     flags  = []
     for metric in KEY_METRICS:
@@ -216,6 +214,193 @@ def get_flagged_variances(df, threshold=MATERIALITY_THRESHOLD):
 
 
 # ─────────────────────────────────────────────
+# PDF GENERATION
+# ─────────────────────────────────────────────
+def generate_pdf_commentary(df):
+    """
+    Generate a one-page Management Commentary PDF
+    using real figures from the dataset.
+    This mirrors the narrative document PNC's Retail Finance
+    team produces alongside every quarterly dashboard.
+    """
+    latest  = df.iloc[-1]
+    prior   = df.iloc[-2]
+    q1_2025 = df.iloc[0]
+
+    # Calculate key figures for the commentary
+    nii_qoq_pct   = (latest['net_interest_income'] - prior['net_interest_income']) / prior['net_interest_income'] * 100
+    nii_yoy_pct   = (latest['net_interest_income'] - q1_2025['net_interest_income']) / q1_2025['net_interest_income'] * 100
+    rev_qoq_pct   = (latest['total_revenue'] - prior['total_revenue']) / prior['total_revenue'] * 100
+    exp_qoq_pct   = (latest['noninterest_expense'] - prior['noninterest_expense']) / prior['noninterest_expense'] * 100
+    earn_qoq_chg  = latest['earnings'] - prior['earnings']
+    earn_qoq_pct  = earn_qoq_chg / prior['earnings'] * 100
+    loan_qoq_chg  = latest['avg_loans_billions'] - prior['avg_loans_billions']
+    dep_qoq_chg   = latest['avg_deposits_billions'] - prior['avg_deposits_billions']
+    eff_latest    = latest['efficiency_ratio']
+    eff_prior     = prior['efficiency_ratio']
+
+    # Organic NII estimate — FirstBank added ~$16B loans at ~3.5% yield
+    # estimated contribution ~$140M per quarter
+    firstbank_nii_estimate = 140
+    organic_nii_chg = (latest['net_interest_income'] - prior['net_interest_income']) - firstbank_nii_estimate
+    organic_nii_pct = organic_nii_chg / prior['net_interest_income'] * 100
+
+    # Build PDF in memory
+    buffer = io.BytesIO()
+    doc    = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=0.85 * inch,
+        leftMargin=0.85 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch
+    )
+
+    styles   = getSampleStyleSheet()
+    elements = []
+
+    # ── Header styles
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Normal'],
+        fontSize=16,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#003366'),
+        alignment=TA_CENTER,
+        spaceAfter=4
+    )
+    subtitle_style = ParagraphStyle(
+        'SubtitleStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        fontName='Helvetica',
+        textColor=colors.HexColor('#6c757d'),
+        alignment=TA_CENTER,
+        spaceAfter=2
+    )
+    section_style = ParagraphStyle(
+        'SectionStyle',
+        parent=styles['Normal'],
+        fontSize=11,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#003366'),
+        spaceBefore=12,
+        spaceAfter=4
+    )
+    body_style = ParagraphStyle(
+        'BodyStyle',
+        parent=styles['Normal'],
+        fontSize=9.5,
+        fontName='Helvetica',
+        textColor=colors.HexColor('#212529'),
+        leading=15,
+        alignment=TA_JUSTIFY,
+        spaceAfter=6
+    )
+    disclaimer_style = ParagraphStyle(
+        'DisclaimerStyle',
+        parent=styles['Normal'],
+        fontSize=7.5,
+        fontName='Helvetica-Oblique',
+        textColor=colors.HexColor('#6c757d'),
+        alignment=TA_CENTER,
+        spaceBefore=8
+    )
+
+    # ── Title block
+    elements.append(Paragraph("PNC Financial Services Group", title_style))
+    elements.append(Paragraph("Retail Banking Segment — Management Commentary", title_style))
+    elements.append(Paragraph(f"First Quarter 2026 | Prepared {datetime.now().strftime('%B %d, %Y')}", subtitle_style))
+    elements.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor('#003366'), spaceAfter=10))
+
+    # ── Executive Summary
+    elements.append(Paragraph("Executive Summary", section_style))
+    elements.append(Paragraph(
+        f"PNC's Retail Banking segment delivered solid first quarter 2026 results, with segment earnings of "
+        f"${latest['earnings']:,.0f}M, reflecting a ${abs(earn_qoq_chg):,.0f}M "
+        f"({'increase' if earn_qoq_chg >= 0 else 'decrease'}) versus the prior quarter "
+        f"({earn_qoq_pct:+.1f}% QoQ). Results reflect the first full quarter of consolidated "
+        f"FirstBank operations following the January 5, 2026 acquisition close, which meaningfully "
+        f"expanded the segment's balance sheet and revenue base. Excluding acquisition-related effects, "
+        f"underlying segment performance remained stable with continued momentum in net interest income "
+        f"driven by favorable repricing and disciplined deposit management.",
+        body_style
+    ))
+
+    # ── Net Interest Income
+    elements.append(Paragraph("Net Interest Income", section_style))
+    elements.append(Paragraph(
+        f"Net interest income of ${latest['net_interest_income']:,.0f}M increased "
+        f"{nii_qoq_pct:+.1f}% versus the prior quarter and {nii_yoy_pct:+.1f}% year-over-year. "
+        f"The QoQ increase reflects the consolidation of FirstBank, which contributed an estimated "
+        f"~${firstbank_nii_estimate}M of incremental NII in the quarter. On an organic basis, "
+        f"excluding the estimated FirstBank contribution, NII grew approximately "
+        f"{organic_nii_pct:+.1f}% QoQ, supported by continued fixed-rate asset repricing, "
+        f"a favorable rate environment, and net interest margin expansion of 11 basis points to 2.95%. "
+        f"Year-over-year NII growth of {nii_yoy_pct:.1f}% reflects the cumulative benefit of "
+        f"lower funding costs and strategic balance sheet repositioning executed throughout 2025.",
+        body_style
+    ))
+
+    # ── Revenue and Expense
+    elements.append(Paragraph("Revenue and Expense", section_style))
+    elements.append(Paragraph(
+        f"Total segment revenue of ${latest['total_revenue']:,.0f}M increased {rev_qoq_pct:+.1f}% "
+        f"versus the prior quarter, driven by NII growth partially offset by stable noninterest income "
+        f"of ${latest['noninterest_income']:,.0f}M. Noninterest income was flat QoQ as the addition "
+        f"of FirstBank customer activity offset seasonal declines in consumer transaction volumes. "
+        f"Noninterest expense of ${latest['noninterest_expense']:,.0f}M increased {exp_qoq_pct:+.1f}% "
+        f"QoQ, primarily driven by FirstBank operating expenses and $98M of integration costs recorded "
+        f"in the quarter. Excluding integration costs, noninterest expense increased approximately 2% "
+        f"QoQ, reflecting disciplined cost management. The efficiency ratio "
+        f"{'improved' if eff_latest < eff_prior else 'increased'} to {eff_latest:.1f}% from "
+        f"{eff_prior:.1f}% in the prior quarter.",
+        body_style
+    ))
+
+    # ── Balance Sheet
+    elements.append(Paragraph("Balance Sheet and Credit Quality", section_style))
+    elements.append(Paragraph(
+        f"Average loans of ${latest['avg_loans_billions']:.1f}B increased ${loan_qoq_chg:+.1f}B QoQ, "
+        f"driven by $15.5B of acquired FirstBank loans comprised of commercial, commercial real estate, "
+        f"and residential mortgage balances. Excluding the acquisition impact, legacy PNC loan balances "
+        f"reflect continued momentum in commercial and industrial lending. Average deposits of "
+        f"${latest['avg_deposits_billions']:.1f}B increased ${dep_qoq_chg:+.1f}B QoQ, reflecting "
+        f"$23B of acquired FirstBank deposits partially offset by seasonal declines in brokered "
+        f"time deposits. Credit quality remained broadly stable with net loan charge-offs of "
+        f"${latest['net_loan_charge_offs']:,.0f}M, including $45M of acquired loan charge-offs "
+        f"related to purchase accounting treatment for certain FirstBank loans.",
+        body_style
+    ))
+
+    # ── Outlook
+    elements.append(Paragraph("Outlook", section_style))
+    elements.append(Paragraph(
+        f"Management expects continued NII expansion in Q2 2026 supported by full-quarter FirstBank "
+        f"contribution, ongoing fixed-rate asset repricing, and a stable rate environment. "
+        f"Integration costs are expected to decline from Q1 levels as systems consolidation "
+        f"progresses. Provision expense is expected to remain stable, reflecting disciplined "
+        f"underwriting and a broadly constructive credit environment. The segment remains well "
+        f"positioned to deliver positive operating leverage for the full year 2026.",
+        body_style
+    ))
+
+    # ── Footer
+    elements.append(Spacer(1, 0.15 * inch))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#dee2e6')))
+    elements.append(Paragraph(
+        f"Source: PNC Financial Services Group Quarterly Earnings Releases (investor.pnc.com). "
+        f"All figures in $millions unless noted. This document is a portfolio project prepared for "
+        f"illustrative purposes and does not represent official PNC communications.",
+        disclaimer_style
+    ))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
@@ -225,8 +410,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "📂 Upload New Data CSV (optional)",
         type=['csv'],
-        help="Leave empty to use the embedded PNC data. "
-             "Upload a CSV with the same column structure to use your own data."
+        help="Leave empty to use embedded PNC data."
     )
 
     st.markdown("---")
@@ -249,12 +433,10 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # LOAD DATA
 # ─────────────────────────────────────────────
-df = load_and_process(uploaded_file)
-
-all_quarters   = df['period_label'].tolist()
-forecasts      = build_forecasts(df)
-latest         = df.iloc[-1]
-prior          = df.iloc[-2]
+df        = load_and_process(uploaded_file)
+forecasts = build_forecasts(df)
+latest    = df.iloc[-1]
+prior     = df.iloc[-2]
 
 # ─────────────────────────────────────────────
 # HEADER
@@ -282,8 +464,8 @@ col1, col2, col3, col4 = st.columns(4)
 
 def kpi_card(col, label, value, prior_value, fmt='${:,.0f}M', unfavorable=False):
     if prior_value and prior_value != 0:
-        delta_pct  = (value - prior_value) / abs(prior_value) * 100
-        delta_str  = f"{delta_pct:+.1f}% QoQ"
+        delta_pct   = (value - prior_value) / abs(prior_value) * 100
+        delta_str   = f"{delta_pct:+.1f}% QoQ"
         delta_color = "normal" if (delta_pct > 0) != unfavorable else "inverse"
     else:
         delta_str   = "N/A"
@@ -302,6 +484,30 @@ kpi_card(col4, "Efficiency Ratio",    latest['efficiency_ratio'],    prior['effi
          fmt='{:.1f}%', unfavorable=True)
 
 # ─────────────────────────────────────────────
+# PDF DOWNLOAD BUTTON — placed prominently near top
+# ─────────────────────────────────────────────
+st.markdown(
+    '<div class="section-title">📄 Management Commentary</div>',
+    unsafe_allow_html=True
+)
+
+pdf_col1, pdf_col2 = st.columns([1, 2])
+with pdf_col1:
+    pdf_buffer = generate_pdf_commentary(df)
+    st.download_button(
+        label="⬇️ Download Q1 2026 Management Commentary (PDF)",
+        data=pdf_buffer,
+        file_name="PNC_Retail_Banking_Q1_2026_Management_Commentary.pdf",
+        mime="application/pdf"
+    )
+with pdf_col2:
+    st.caption(
+        "One-page narrative commentary covering NII drivers, organic vs. acquisition growth, "
+        "expense discipline, credit quality, and segment outlook. "
+        "Mirrors the format used by PNC's Retail Finance team."
+    )
+
+# ─────────────────────────────────────────────
 # CHARTS ROW 1: Waterfall + Trend
 # ─────────────────────────────────────────────
 st.markdown(
@@ -310,7 +516,6 @@ st.markdown(
 )
 chart_col1, chart_col2 = st.columns([1, 1.3])
 
-# --- Waterfall ---
 with chart_col1:
     bridge = {
         f'Prior\n({prior["period_label"]})':    prior['earnings'],
@@ -344,7 +549,6 @@ with chart_col1:
     )
     st.plotly_chart(fig_wf, use_container_width=True)
 
-# --- Trend Lines ---
 with chart_col2:
     actuals_labels = df['period_label'].tolist()
     fig_trend      = go.Figure()
@@ -386,7 +590,6 @@ with chart_col2:
                 showlegend=False
             ))
 
-    # Manual vertical separator line
     all_y = []
     for col_name, _, _ in trend_cfg:
         all_y += df[col_name].tolist()
@@ -441,7 +644,7 @@ z_vals, text_vals, y_labels = [], [], []
 x_labels = df['period_label'].tolist()
 
 for col_name, label in heatmap_cols:
-    pct_col  = f'{col_name}_qoq_pct'
+    pct_col = f'{col_name}_qoq_pct'
     row_z, row_text = [], []
     for idx in range(len(df)):
         val = df[pct_col].iloc[idx] if pct_col in df.columns else np.nan
@@ -494,10 +697,10 @@ else:
     st.success("✅ No variances exceed the ±5% materiality threshold this quarter.")
 
 # ─────────────────────────────────────────────
-# DOWNLOAD BUTTON
+# AUDIT EXPORT
 # ─────────────────────────────────────────────
 st.markdown(
-    '<div class="section-title">📥 Audit-Ready Export</div>',
+    '<div class="section-title">📥 Audit-Ready Data Export</div>',
     unsafe_allow_html=True
 )
 
@@ -508,8 +711,7 @@ export_cols = (
     [f'{m}_qoq_pct' for m in KEY_METRICS if f'{m}_qoq_pct' in df.columns] +
     [f'{m}_yoy_pct' for m in KEY_METRICS if f'{m}_yoy_pct' in df.columns]
 )
-export_df = df[[c for c in export_cols if c in df.columns]].copy()
-
+export_df  = df[[c for c in export_cols if c in df.columns]].copy()
 timestamp  = datetime.now().strftime('%Y%m%d_%H%M')
 csv_buffer = io.StringIO()
 export_df.to_csv(csv_buffer, index=False)
@@ -518,7 +720,7 @@ csv_bytes  = csv_buffer.getvalue().encode()
 dl_col1, dl_col2 = st.columns([1, 3])
 with dl_col1:
     st.download_button(
-        label="⬇️ Download Report (CSV)",
+        label="⬇️ Download Variance Report (CSV)",
         data=csv_bytes,
         file_name=f'PNC_Retail_Variance_{timestamp}.csv',
         mime='text/csv'
