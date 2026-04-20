@@ -2,3 +2,4 @@ streamlit
 plotly
 scipy
 openpyxl
+reportlab
